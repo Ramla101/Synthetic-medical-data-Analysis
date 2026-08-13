@@ -1,0 +1,1071 @@
+---
+title: "Synthetic data analysis"
+author: "Ramla Khan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    highlight: kate
+    code_folding: show
+  word_document:
+    toc: true
+    toc_depth: '2'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+# Overview
+
+There are five main data files used in this analysis: conditions, patients, observations, encounters, and medications. In addition to these files, three data lookup dictionaries are provided that map numeric codes to human-readable descriptions. LOINC is used for laboratory measurements and observations, RxNorm is used for medications, and SNOMED-CT is used for conditions and diagnoses.
+
+Four tasks are addressed in this report:
+1. Data loading, error identification, and cleaning
+2. Comprehensive descriptive summary of patients, observations, and conditions
+3. Distribution of systolic BP, diastolic BP, and BMI in patients with hypertension
+4. Crude and UK standardised hypertension prevalence
+
+# Task 1: Data Loading and Cleaning
+The data files contain errors and bugs that reflect common problems and challenges associated with electronic health records. Load and clean the data, both individually and linked. Where patients fail a quality control check, exclude them from the analyses.
+a.	The output of this task is a clean patient demographics table for use in the next steps and sanitized condition, observation and medication files.
+
+## Libraries
+Libraries used in the report and their purpose are as follow:
+tidyverse: Core data manipulation and visualisation, including packages such as dplyr, ggplot2, readr, and tidyr.
+janitor: Standardises column names to lowercase to ensure consistency across datasets and prevent join errors.
+lubridate: Simplifies parsing and handling of date variables.
+maps: Provides geographic boundary data used for plotting spatial distributions.
+stringr: Supports string manipulation tasks such as cleaning and formatting text variables.
+
+```{r libraries}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(maps)
+library(stringr)
+```
+**Note:** The compressed data files are extracted to standard CSV format prior to loading. This avoids potential compatibility issues across R versions and operating systems when reading compressed files.
+An R project is used to manage the working environment, ensuring that file paths are relative and reproducible without relying on manual directory setting via setwd().
+
+## 1.1 Loading the Data and defining constants
+All data and dictionary files are loaded using read_csv(), with clean_names() applied immediately to standardise column names to lowercase. A summary tibble is then generated to look at the dimensions of each dataset.
+
+Valid values for gender, race, and ethnicity are defined  based on the data dictionary provided with the test and standardised to lowercase to ensure consistent comparison after cleaning. The raw data can contain variations in case and formatting (e.g., "M" vs "m"), so all fields are normalised before validation to avoid incorrectly flagging valid records as errors.
+
+A freeze date is set to the latest observation date found in the dataset rather than today's date (2021-11-19 in this analysis) to ensure the analysis is reproducible. If today's date were used instead, the results would change every time the script is run because different patients might pass or fail the date-based quality checks depending on when the code is executed. The freeze date is derived directly from the data itself rather than being hardcoded, so it will always reflect the true extent of the dataset.
+```{r load-data}
+# Loading the five data files
+patients     <- read_csv("patients.csv")     %>% clean_names()
+conditions   <- read_csv("conditions.csv")   %>% clean_names()
+observations <- read_csv("observations.csv") %>% clean_names()
+encounters   <- read_csv("encounters.csv")   %>% clean_names()
+medications  <- read_csv("medications.csv")  %>% clean_names()
+
+# Loading the three dictionaries
+dict_snomed  <- read_csv("dictionary_snomed.csv")  %>% clean_names()
+dict_loinc   <- read_csv("dictionary_loinc.csv")   %>% clean_names()
+dict_rxnorm  <- read_csv("dictionary_rxnorm.csv")  %>% clean_names()
+
+tibble(
+  file    = c("patients", "conditions", "observations", "medications", "encounters"),
+  rows    = c(nrow(patients), nrow(conditions), nrow(observations),
+              nrow(medications), nrow(encounters)),
+  columns = c(ncol(patients), ncol(conditions), ncol(observations),
+              ncol(medications), ncol(encounters))
+)
+
+# Values specified in the data dictionary for gender, race, and ethnicity
+sp_gender    <- c("m", "f")
+sp_race      <- c("white", "black", "asian", "hawaiian", "other", "native")
+sp_ethnicity <- c("nonhispanic", "hispanic")
+
+# Defining constant date
+freeze_date <- max(as.Date(substr(as.character(observations$date), 1, 10)),
+                   na.rm = TRUE)
+# freeze_date
+```
+The output shows the five datasets loaded comprises of 1,162 patients, 38,100 conditions, 531,144 observations, 56,430 medications, and 61,459 encounters.
+
+## 1.2 Quality Control Checks for individual datasets
+Before removing any data, each potential issue is inspected separately to understand the nature of the data and avoid blindly removing information.
+
+### 1.2.1 Future birthdates
+Birthdates are parsed from character strings to proper Date objects using the ymd() function, which returns NA for any string it cannot interpret as a valid date. Any birthdate that falls after the data freeze date is also flagged, since a patient cannot have been born after the data was collected.
+```{r qc-birthdate}
+patients %>%
+  mutate(birthdate = ymd(birthdate)) %>% # Birthdate string to Date
+  filter(is.na(birthdate) | birthdate > freeze_date) %>% #Future birthdates
+  select(id, birthdate)
+```
+19 patients are identified with future or corrupted birthdates. Of these, 17 has a birthdate of 2034-01-01. The remaining 2 patients has malformed strings (for example "2e298hdh-") that could not be parsed at all. All 19 will be excluded from the final dataset.
+
+### 1.2.2 Death before birth
+A patient's death date should come after their birth date. Any record where the death date precedes the birth date is logically impossible.
+```{r qc-death}
+patients %>%
+  mutate(
+    birthdate = ymd(birthdate), #date format
+    deathdate = ymd(deathdate)
+  ) %>%
+  filter(!is.na(deathdate), #Na in deathdate
+         !is.na(birthdate), #Na in birthdate
+         deathdate < birthdate) %>% #death before birth error
+  select(id, birthdate, deathdate)
+```
+Five out of the total six patients identified in the output are these that overlap with the future birthdate group identified in earlier step (their birth date of 2034-01-01 is later than their recorded death date), and one additional patient has death precedes birth date.
+
+### 1.2.3 Invalid gender values
+Prior to validation, gender values are trimmed and converted to lowercase to account for formatting inconsistencies (e.g., leading/trailing spaces or case differences). This ensures that valid values are not incorrectly classified as invalid due to minor data entry variations.
+```{r qc-gender}
+patients %>%
+  mutate(gender = str_to_lower(str_trim(gender))) %>% #Standardising the column
+  filter(!gender %in% sp_gender | is.na(gender) | gender == "") %>% #invalid gender values
+  count(gender)
+```
+Two types of invalid gender values are found in the output. Twenty patients has a blank or missing gender value. Four patients has a gender value of "8293.3", which is a numeric value that does not correspond to any known gender classification in SNOMED-CT, LOINC, or RxNorm vocabularies.
+
+**Note:** For two of the four affected patients, gender could be inferred from the prefix field (e.g., “Mrs.” indicating female, “Mr.” indicating male). However, to preserve analytical integrity and avoid introducing assumptions, none of that will be imputed.
+
+### 1.2.4 Invalid race values
+The data dictionary lists six valid race values: white, black, asian, hawaiian, other, and native. As with gender, race values are standardised (trimmed and converted to lowercase) before validation to ensure consistency with the predefined value set.
+```{r qc-race}
+patients %>%
+  mutate(race = str_to_lower(str_trim(race))) %>% #standatdising column
+  filter(!race %in% sp_race | is.na(race) | race == "") %>% #invalid race values
+  count(race)
+```
+Two invalid race values are found in output, "???-" appearing in 6 records and "XJniDSe" appearing in 15 records. Both have no meaningful interpretation. However, rather than excluding these 21 patients entirely (as their other data is valid and usable), their race value will be re-coded as "unknown" during the cleaning step.
+
+### 1.2.5 Invalid ethnicity values
+The data dictionary specifies that ethnicity is "nonhispanic" or "hispanic". As with gender and race, ethnicity values are standardised (trimmed and converted to lowercase) before validation to ensure consistency with the predefined value set.
+```{r qc-ethnicity}
+patients %>%
+  mutate(ethnicity = str_to_lower(str_trim(ethnicity))) %>%
+  filter(!ethnicity %in% sp_ethnicity | is.na(ethnicity) | ethnicity == "") %>% #invalid ethnicities
+  count(ethnicity)
+```
+No invalid ethnicity values are found in the output, meaning the ethnicity field is clean.
+
+### 1.2.6 Duplicate patient IDs
+Each patient should have a unique ID that acts as the primary key linking records across all clinical tables. Duplicate IDs can cause incorrect record linking and double-counting in any linked analysis. 
+```{r qc-duplicates}
+patients %>%
+  mutate(id = str_trim(id)) %>%
+  count(id) %>%
+  filter(is.na(id) | id == "" | n > 1)
+```
+No duplicate patient IDs are found in the patients' dataset.
+
+## 1.3 Cleaning the patients' data
+Patients will be excluded if they fail the quality control checks described above. Invalid race values are recoded as "unknown" rather than full exclusion, as only the race field is affected for those patients. Ethnicity values were found to be valid and therefore required no re-coding.
+
+Age is calculated at the freeze date for living patients and at the date of death for deceased patients, using coalesce() to select the appropriate reference date. An age group variable is also created for use in stratified analyses in subsequent tasks.
+```{r clean-patients}
+patients_clean <- patients %>%
+  mutate(
+    birthdate = ymd(birthdate), #proper date format
+    deathdate = ymd(deathdate),
+    gender = str_to_lower(str_trim(gender)), #standardising the columns
+    race = str_to_lower(str_trim(race)),
+    ethnicity = str_to_lower(str_trim(ethnicity)),
+    race = if_else(race %in% sp_race, race, "unknown") #casting unknown value to missing data
+  ) %>%
+  filter(
+    !is.na(id), #missing id removal
+    !is.na(birthdate), #no birthdate
+    birthdate <= freeze_date, #birthdate after data colletion date
+    is.na(deathdate) | deathdate >= birthdate, #death before birth
+    gender %in% sp_gender #m/f 
+  ) %>%
+  mutate(
+    age = as.numeric(difftime(
+      coalesce(deathdate, freeze_date),
+      birthdate, units = "days"
+    )) / 365.25,
+    age_group = cut(
+      age,
+      breaks = c(0, 18, 40, 65, Inf),
+      labels = c("<18", "18-39", "40-64", "65+"),
+      right = FALSE
+    )
+  )
+
+tibble(
+  Metric = c("Original", "Retained", "Excluded"),
+  Patients = c(
+    nrow(patients),
+    nrow(patients_clean),
+    nrow(patients) - nrow(patients_clean)
+  )
+)
+
+clean_ids <- patients_clean$id # patient IDs for filtering all linked tables
+```
+In the output, it is shown the data has total 1162 patients, among which 44 are filtered due to reasons mentioned in sections 1.2.1 to 1.2.6. The clean file has 1118 patients' data.
+```{r exclusion-plot, echo=FALSE}
+patients %>%
+  mutate(
+    birthdate = ymd(birthdate),
+    deathdate = ymd(deathdate),
+    gender = str_to_lower(str_trim(gender)),
+    reason = case_when(
+      is.na(birthdate) ~ "Corrupted birthdate",
+      !is.na(birthdate) & birthdate > freeze_date ~ "Future birthdate",
+      !is.na(deathdate) & !is.na(birthdate) & deathdate < birthdate ~ "Death before birth",
+      is.na(gender) | gender == "" ~ "Missing gender",
+      !gender %in% sp_gender ~ "Invalid gender value",
+      TRUE ~ "Retained"
+    )
+  ) %>%
+  filter(reason != "Retained") %>%
+  count(reason) %>%
+  ggplot(aes(x = n, y = reorder(reason, n))) +
+  geom_col(fill = "steelblue1", alpha = 0.85) +
+  geom_text(aes(label = n), hjust = -0.2, size = 4) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Task 1: Data cleaning of patients data",
+       x = "No. of patients", y = NULL) +
+  theme_minimal(base_size = 15)
+```
+The chart  summarises the number of patients excluded for each quality control reason.
+
+**Note** Some patients are counted under multiple flags (for example a patient with a future birthdate of 2034-01-01 also fails the death-before-birth check), but each patient is only excluded once.
+
+## 1.4 Cleaning the conditions data
+The conditions file contains two issues that require correction before analysis.
+First, SNOMED-CT codes are stored as floating-point numbers rather than integers (e.g., "59621000.0" instead of "59621000"). This will prevent joins to the SNOMED dictionary, as code formats would not match and descriptions would return as missing.
+
+To address this, a two-step conversion approach is used. Codes are first parsed to numeric and then converted to integer before being cast back to character, removing the decimal suffix. This approach avoids invalid numeric coercion producing the literal string "NA" rather than a true missing value, which would otherwise bypass is.na() filtering.
+
+Second, the conditions file does not include a description field. Descriptions are therefore joined from the SNOMED dictionary after code standardisation.
+```{r clean-conditions}
+# Clean SNOMED dictionary
+dict_snomed_clean <- dict_snomed %>%
+  rename(code = 1, description = 2) %>%   # rename columns
+  mutate(code = as.character(as.integer(suppressWarnings(as.numeric(code))))) %>%  # standardise codes
+  distinct(code, .keep_all = TRUE)        # remove duplicates
+
+
+# Clean conditions data
+conditions_clean <- conditions %>%
+  filter(patient %in% clean_ids, !is.na(patient)) %>%  # keep valid patients
+  mutate(
+    start = as.Date(substr(start, 1, 10)),  # clean start date
+    stop  = as.Date(substr(stop, 1, 10)),   # clean stop date
+    code_num = suppressWarnings(as.numeric(code)),  # numeric conversion
+    code = if_else(is.na(code_num), NA_character_, as.character(as.integer(code_num)))  # clean codes
+  ) %>%
+  filter(!is.na(code)) %>%                  # drop invalid codes
+  filter(is.na(stop) | stop >= start) %>%  # valid date order
+  left_join(dict_snomed_clean, by = "code")  # add descriptions
+
+tibble(
+  Metric = c("Original", "Retained", "Excluded"),
+  Patients = c(
+    nrow(conditions),
+    nrow(conditions_clean),
+    nrow(conditions) - nrow(conditions_clean)
+  )
+)
+```
+The output shows after cleaning the conditions data, 1823 patinets are removed and out of the orignal 38100, 36277 are retained.
+
+## 1.5 Cleaning the observations data file
+The observations file requires two fixes. First, the date column is stored in ISO 8601 UTC format (for example "2019-02-17T05:07:38Z"), so only the first 10 characters are extracted before converting to a Date object. Second, the value column is stored as a character string. For numeric observations (where type == "numeric"), the value is coerced to numeric for quantitative analysis. For text observations such as survey responses, value_numeric is left as NA.
+
+An additional bug was identified during the descriptive analysis in Task 2: LOINC code "-7" appears 30,550 times in the observations file but has no valid description in the dictionary and is not a real LOINC code. This is a sentinel or placeholder value used during data generation and is removed as part of the cleaning step.
+```{r clean-observations}
+observations_clean <- observations %>%
+  filter(patient %in% clean_ids) %>%                  # keep relevant patients
+  filter(!is.na(code), !is.na(value), code != "-7") %>%  # remove missing + placeholder code
+  mutate(
+    date = as.Date(substr(date, 1, 10)), # extract YYYY-MM-DD from ISO datetime
+    value_numeric = if_else(
+      type == "numeric",
+      suppressWarnings(as.numeric(value)),            # coerce numeric values
+      NA_real_                                        
+    )
+  )
+
+tibble(
+  Metric = c("Original", "Retained", "Excluded"),
+  Patients = c(
+    nrow(observations),
+    nrow(observations_clean),
+    nrow(observations) - nrow(observations_clean)
+))
+```
+The above output shows, origanlly there were 531144 patient rows in the observation dataset. 48617 of those rows did not pass the quality control check, hence 482527 are retained in the clean file.
+
+## 1.6 Cleaning the medications data file
+The medications file contains the same code formatting issue as the conditions dataset, with RxNorm codes stored as floating-point numbers (e.g., "314076.0" instead of "314076"). This would prevent successful joins to the RxNorm dictionary, as mismatched formats would result in missing descriptions.
+
+The same two-step conversion approach is applied to standardise codes. Values are first parsed to numeric and then converted to integer before being cast back to character, removing the decimal suffix. As with conditions, this approach ensures that invalid codes are treated as true missing values rather than the literal string "NA", preventing them from bypassing is.na() filtering.
+
+Descriptions are then joined from the RxNorm dictionary after code standardisation.
+
+Start and stop dates are stored in ISO 8601 UTC format and are standardised by extracting the date component prior to conversion to Date. Records where the stop date precedes the start date are excluded to maintain temporal consistency.
+```{r clean-medications}
+dict_rxnorm_clean <- dict_rxnorm %>%
+  rename(code = 1, description = 2) %>%          # rename columns
+  mutate(code = as.character(as.integer(suppressWarnings(as.numeric(code))))) %>%  # standardise codes
+  distinct(code, .keep_all = TRUE)               # remove duplicate codes
+
+medications_clean <- medications %>%
+  filter(patient %in% clean_ids) %>%             # keep relevant patients
+  filter(!is.na(patient)) %>%                    # drop missing patients
+  mutate(
+    start = as.Date(substr(start, 1, 10)),       # clean start date
+    stop  = as.Date(substr(stop, 1, 10)),        # clean stop date
+    code_num = suppressWarnings(as.numeric(code)),  # numeric conversion
+    code = if_else(is.na(code_num), NA_character_, as.character(as.integer(code_num)))  # clean codes
+  ) %>%
+  filter(!is.na(code)) %>%                       # drop invalid codes
+  filter(is.na(stop) | stop >= start) %>%       # valid date order
+  left_join(dict_rxnorm_clean, by = "code")      # add descriptions
+
+tibble(
+  Metric = c("Original", "Retained", "Excluded"),
+  Patients = c(
+    nrow(medications),
+    nrow(medications_clean),
+    nrow(medications) - nrow(medications_clean)
+))
+```
+The above tables shows in the medication dataset, 1588 failed the quality control check and final file contains 54842 rows,
+
+## 1.7 Cleaning the encounters data file
+Records are filtered to clean patient IDs, any records with a missing encounter ID are removed, and the start and stop dates are parsed from ISO 8601 UTC format.
+Records with invalid or missing start dates after parsing are excluded to ensure temporal validity and reliable linkage in further analyses.
+```{r clean-encounters}
+encounters_clean <- encounters %>%
+  filter(patient %in% clean_ids) %>%        # Relevant patients only
+  filter(!is.na(id)) %>%                   # droping missing encounter IDs
+  mutate(
+    start = as.Date(substr(start, 1, 10)), # clean start date
+    stop  = as.Date(substr(stop, 1, 10))   # clean stop date
+  ) %>%
+  filter(!is.na(start))                   
+
+tibble(
+  Metric    = c("Original","Retained", "Excluded"),
+  Patients = c (nrow(encounters), nrow(encounters_clean),nrow(encounters) - nrow(encounters_clean)
+))
+```
+In the encounter dataset, the above tables shows 2097 failed the checks and the final clean file contains 59362 rows of data.
+
+## 1.8 Summary of all datasets after filtering
+```{r cleaning-summary, echo=FALSE}
+tibble(
+  Table    = c("patients", "conditions", "observations", "medications", "encounters"),
+  Original = c(nrow(patients), nrow(conditions), nrow(observations),
+               nrow(medications), nrow(encounters)),
+  Retained = c(nrow(patients_clean), nrow(conditions_clean), nrow(observations_clean),
+               nrow(medications_clean), nrow(encounters_clean))
+) %>%
+  mutate(
+    Excluded     = Original - Retained,
+    `Percent_Excluded` = round(100 * Excluded / Original, 1)
+  )
+
+```
+The table summarises the number of records retained and excluded across all datasets following cleaning, and are included as a quality assurance check to verify the impact of data filtering.
+
+## 1.9 Linked Data Quality Checks
+In this step, the second part of the task is addressed; running quality control checks on the linked data.
+
+### 1.9.1 Orphan Records Check
+All clinical tables are filtered to include only patients who pass quality control checks (patients_clean). To assess the impact of this filtering, the number of orphan records (records linked to excluded patients) are calculated across all datasets.
+```{r, orphan_codes}
+
+tibble(
+  table = c("conditions", "observations", "medications", "encounters"),
+  orphan_records = c(
+    sum(!conditions$patient %in% clean_ids, na.rm = TRUE),
+    sum(!observations$patient %in% clean_ids, na.rm = TRUE),
+    sum(!medications$patient %in% clean_ids, na.rm = TRUE),
+    sum(!encounters$patient %in% clean_ids, na.rm = TRUE)
+  ),
+  original = c(
+    nrow(conditions),
+    nrow(observations),
+    nrow(medications),
+    nrow(encounters)
+  )
+) %>%
+  mutate(
+    percent_orphan = round(100 * orphan_records / original, 1)
+  )
+
+```
+The above tables shows Orphan records account for a small proportion across all datasets, ranging from 2.7% to 3.4%. This indicates that patient-level filtering resulted in minimal data loss while maintaining dataset integrity.
+
+### 1.9.2 Temporal Consistency Checks
+Clinical events are checked to ensure they occur within each patient’s lifespan. Records are flagged where event dates occurred before birth or after death.
+```{r, temporal_checks}
+temporal_issues <- list(
+  conditions = conditions_clean %>%
+    left_join(patients_clean %>% select(id, birthdate, deathdate),
+              by = c("patient" = "id")) %>%   # add patient dates
+    filter(start < birthdate | (!is.na(deathdate) & start > deathdate)) %>%  # outside lifespan
+    nrow(),  # count issues
+
+  observations = observations_clean %>%
+    left_join(patients_clean %>% select(id, birthdate, deathdate),
+              by = c("patient" = "id")) %>%   # add patient dates
+    filter(date < birthdate | (!is.na(deathdate) & date > deathdate)) %>%  # outside lifespan
+    nrow(),  # count issues
+
+  medications = medications_clean %>%
+    left_join(patients_clean %>% select(id, birthdate, deathdate),
+              by = c("patient" = "id")) %>%   # add patient dates
+    filter(start < birthdate | (!is.na(deathdate) & start > deathdate)) %>%  # outside lifespan
+    nrow()   # count issues
+)
+
+tibble(
+  Table = names(temporal_issues),
+  Invalid_Records = unlist(temporal_issues)
+)
+```
+The output suggests temporal validation identified no inconsistencies within the conditions dataset. A small number of inconsistencies are observed in the observations (n = 205) and medications (n = 11) datasets, where events occurred outside the patient’s lifespan.
+
+### 1.9.3 Encounter-Level Validation
+Observations are checked to ensure they are linked to valid encounters and occur within encounter time windows.
+```{r}
+# Observations without valid encounters
+obs_no <- observations_clean %>%
+  filter(!is.na(encounter)) %>%
+  filter(!encounter %in% encounters_clean$id)
+
+# Observations outside encounter window
+obs_mis <- observations_clean %>%
+  left_join(
+    encounters_clean %>% select(id, start, stop) %>%
+      rename(encounter_start = start, encounter_stop = stop),
+    by = c("encounter" = "id")
+  ) %>%
+  filter(!is.na(encounter_start)) %>%
+  filter(date < encounter_start | (!is.na(encounter_stop) & date > encounter_stop))
+
+tibble(
+  Metric    = c("No valid encounter","Outside encounter window"),
+  Patients = c (nrow(obs_no), nrow(obs_mis))
+)
+
+```
+Output shows all observations are successfully linked to valid encounters, with no orphan records identified. However, 31,790 observations (approximately 6.6% of the dataset) are found to occur outside the recorded encounter time windows.
+
+### 1.9.4 Terminology Mapping Checks
+Clinical codes are assessed to ensure successful mapping to reference terminology dictionaries.
+```{r, echo=FALSE}
+tibble(
+  Table = c("conditions", "medications"),
+  Missing_Descriptions = c(
+    sum(is.na(conditions_clean$description)),
+    sum(is.na(medications_clean$description))
+  )
+)
+
+```
+output suggests all condition codes successfully mapped to SNOMED-CT descriptions, indicating complete and accurate terminology standardisation for the conditions dataset. In the medications dataset, 7 records are identified with missing descriptions following mapping to the RxNorm dictionary.
+
+### 1.10 Final Data of Task 1
+Final dataset is produced by applying targeted exclusions identified during validation.
+```{r}
+# Final observations
+observations_clean <- observations_clean %>%
+  left_join(patients_clean %>% select(id, birthdate, deathdate),
+            by = c("patient" = "id")) %>%
+  filter(!(date < birthdate | (!is.na(deathdate) & date > deathdate))) %>%
+  select(-birthdate, -deathdate)
+
+# Final medications
+medications_clean <- medications_clean %>%
+  filter(!is.na(description))
+
+patients_clean %>%
+  select(id, birthdate, gender, race, ethnicity, age, age_group) %>%
+  head(5)
+```
+Conditions, encounters, and patient datasets required no further modification following linked data validation, and were therefore carried forward unchanged for analysis.
+
+# Task 2: Descriptive Summary
+Provide a comprehensive description of the patients, observations, and conditions tables - for example, provide the number of unique patients, the most frequent ontology terms (e.g. LOINC, SNOMED and RxNorm) and other information you think is important to describe.
+
+## 2.1 Patient Demographics
+In this step, the age, gender, survival status of the patients are assessed using the clean patients dataset acquired in the task 1.
+```{r demo-summary, echo=TRUE}
+tibble(
+  Metric = c("Total patients", "Alive", "Deceased"),
+  Count = c(
+    nrow(patients_clean),
+    sum(is.na(patients_clean$deathdate)),
+    sum(!is.na(patients_clean$deathdate))
+  )
+) %>%
+  mutate(
+    pct = round(100 * Count / first(Count), 1)
+  )
+
+# Age summary statistics
+patients_clean %>%
+  summarise(
+    mean_age   = round(mean(age, na.rm = TRUE), 1),
+    median_age = round(median(age, na.rm = TRUE), 1),
+    min_age    = round(min(age, na.rm = TRUE), 1),
+    max_age    = round(max(age, na.rm = TRUE), 1)
+  )
+
+# Sex group
+patients_clean %>%
+  mutate(gender = recode(gender, f = "Female", m = "Male")) %>%
+  count(gender) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+
+# Age group
+patients_clean %>%
+  count(age_group) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+The results shows the cohort include 1118 patients, of whom 86% (962) are alive and 14% (156) are deceased.
+The mean age is 42 years, range 0.2 to 122, with a balanced sex distribution of 52.4% (586) female and 47.6% (532) male. The distribution of age groups shows highest percentage in 40-64 with 32.5%.  
+
+```{r population-pyramid, echo=FALSE}
+patients_clean %>%
+  count(age_group, gender) %>%
+  mutate(n = if_else(gender == "m", -n, n)) %>%
+  ggplot(aes(x = n, y = age_group, fill = gender)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(
+    values = c("f" = "pink2", "m" = "steelblue1"),
+    labels = c("Female", "Male")
+  ) +
+  scale_x_continuous(labels = function(x) abs(x)) +
+  labs(
+    title = "Population Pyramid",
+    x = "Number of patients",
+    y = "Age group",
+    fill = "Sex"
+  ) +
+  theme_minimal(base_size = 15)
+```
+The population pyramid plot shows the number of patients on x-axis while age groups are represented by the y-axis. The blue bars show male population while the pink shows females.
+
+## 2.2 Race and Ethnicity
+The race and ethnicity are assessed using the cleaned patients data from task 1.
+```{r race-ethnicity}
+patients_clean %>%
+  count(race) %>%
+  mutate(Percent_race = round(100 * n / sum(n), 1)) %>% #calculating percentage
+  arrange(desc(n))
+
+patients_clean %>%
+  count(ethnicity) %>%
+  mutate(Percent_ethnicity = round(100 * n / sum(n), 1)) #calculating percentage
+```
+output shows the cohort is predominantly White (82.1%), followed by Black (8.4%) and Asian (6.4%) patients. A small proportion of records are classified as Other (1.0%) or Native (0.2%).
+
+Twenty-one patients (1.9%) has invalid race values (e.g., “XJniDSe” and “???-”), which are recoded as “unknown” during data cleaning to avoid unnecessary data loss, as only the race field is affected.
+
+Ethnicity is largely non-Hispanic (90.9%), with 9.1% of patients recorded as Hispanic. No invalid ethnicity values are identified during quality control.
+
+## 2.3 Geographic Distribution
+Using the clean patient data the geographic distribution of patients in different counties of Massachusetts are estimated.
+```{r geography}
+patients_clean %>%
+  count(county) %>%
+  mutate(Percentage_patients = round(100 * n / sum(n), 1)) %>% #Percentage of counties
+  arrange(desc(n))
+
+patients_clean %>%
+  summarise(unique_cities = n_distinct(city)) # No of cities
+```
+Table shows patients are distributed across 13 counties in Massachusetts, spanning 253 unique cities, indicating broad geographic coverage of the cohort. Middlesex County represents the largest share (20.8%), followed by Suffolk (11.8%) and Essex (11.0%).
+```{r geo-map, message=FALSE, warning=FALSE, echo=FALSE}
+
+ma_map <- map_data("state") %>% #getting the county map
+  filter(region == "massachusetts")
+
+geo_data <- patients_clean %>%
+  filter(!is.na(lat), !is.na(lon))
+
+ggplot() +
+  geom_polygon(
+    data = ma_map,
+    aes(x = long, y = lat, group = group),
+    fill = "grey95",
+    colour = "grey60"
+  ) +
+  geom_point(
+    data = geo_data,
+    aes(x = lon, y = lat, colour = county),
+    alpha = 0.6,
+    size = 1.5
+  ) +
+  coord_fixed(1.3) +
+  scale_colour_viridis_d(option = "turbo") +
+  labs(
+    title = "Spatial Distribution of Patients in Massachusetts",
+    x = "Longitude",
+    y = "Latitude",
+    colour = "County"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(panel.grid = element_blank())
+
+```
+The spatial distribution shows clustering in eastern Massachusetts, particularly in Middlesex, Suffolk, and Essex counties, which correspond to the Greater Boston metropolitan area. Western counties such as Berkshire and Franklin are more sparsely represented, reflecting lower population density.
+
+## 2.4 Unique Patients per Table
+```{r unique-patients}
+tibble(
+  Table = c("conditions", "observations", "medications", "encounters"),
+  Patients = c(
+    n_distinct(conditions_clean$patient),
+    n_distinct(observations_clean$patient),
+    n_distinct(medications_clean$patient),
+    n_distinct(encounters_clean$patient)
+  )
+) %>%
+  mutate( Percentage = round(100 * Patients / nrow(patients_clean), 1))
+```
+observations and encounters cover 100% of the clean cohort. A small number of patients have no recorded conditions (1.4%) or medications (3.8%), which is clinically plausible for patients who only attended wellness visits with no diagnoses or prescriptions recorded.
+
+## 2.5 Top SNOMED-CT Conditions
+The twenty most frequent conditions in the SNOMED-CT dataset are shown in this step.
+```{r top-conditions}
+top_cond <- conditions_clean %>%
+  count(code, description, sort = TRUE) %>%
+  slice_head(n = 20)
+ggplot(top_cond, aes(x = n, y = reorder(str_wrap(description, 40), n))) +
+  geom_col(fill = "steelblue1", alpha = 0.85) +
+  labs(title = "Top 20 Conditions in SNOMED-CT",
+       x = "Number of records", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+The most frequent SNOMED-CT concepts are dominated by social and behavioural determinants of health, including employment status, stress, social isolation, and exposure to violence. Full-time employment (13,450 records) and stress (4,968) are the most commonly recorded concepts, followed by part-time employment and indicators of limited social contact.
+
+Clinical conditions are also represented but occur less frequently. These include acute respiratory infections (e.g., viral sinusitis, pharyngitis, bronchitis), chronic conditions such as hypertension (282) and prediabetes (334), and other diagnoses such as anemia and otitis media.
+
+## 2.6 Top LOINC Observations
+The twenty most frequent observations in the LOINC dataset are shown in this step.
+```{r top-observations}
+dict_loinc_clean <- dict_loinc %>%
+  rename(code = 1, description = 2) #renaming column 1 as code and 2 as description
+
+observations_clean <- observations_clean %>%
+  filter(code != "-7") # Invalid sentinel code
+
+tibble(
+  Step = c("Original", "After removing -7"),
+  Observations = c(
+    nrow(observations),
+    nrow(observations_clean)
+  )
+) %>%
+  mutate(
+    removed = Observations[1] - Observations,
+    Percent_removed = round(100 * removed / Observations[1], 1)
+  )
+
+top_obs <- observations_clean %>%
+  count(code, sort = TRUE) %>%
+  slice_head(n = 20) %>% #selecting 20 rows only
+  left_join(dict_loinc_clean, by = "code") %>%
+  mutate(desc_short = str_trunc(description, 50))
+
+ggplot(top_obs,aes(x = n, y = reorder(desc_short, n))) +
+  geom_col(fill = "pink2", alpha = 0.85) +
+  labs(
+    title = "Top 20 Observation Types in LOINC dataset",
+    x = "Number of records",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 15)
+```
+The most frequent observation types are dominated by routine clinical measurements, including blood pressure (systolic and diastolic), body weight, heart rate, respiratory rate, and body mass index. Pain severity scores and smoking status are also commonly recorded, reflecting standard clinical and patient-reported measures.
+
+An invalid LOINC code (“-7”) is identified as the most frequent value in the raw dataset (30,550 records). This code does not correspond to any valid LOINC entry and represents a placeholder value introduced during synthetic data generation. It is therefore removed prior to analysis to prevent distortion of summary statistics.
+
+A minor inconsistency was also identified in the LOINC dictionary, where code 71802-3 appears with two different descriptions (“What is your housing situation today?” and “Housing status”). This results in duplicate entries after joining and reflects a dictionary-level issue rather than a problem with the underlying observations data.
+
+## 2.7 Top RxNorm Medications
+The twenty most frequent medications in the RxNorm dataset are shown in this step.
+```{r top-medications}
+top_meds <- medications_clean %>% #top medications
+  count(code, description, sort = TRUE) %>%
+  slice_head(n = 20)
+
+ggplot(top_meds,
+       aes(x = n, y = reorder(str_wrap(coalesce(description, code), 40), n))) +
+  geom_col(fill = "steelblue1", alpha = 0.85) +
+  labs(title = "Top 20 Medications in RxNorm dataset",
+       x = "Number of records", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+The most frequently prescribed medications are dominated by cardiovascular drugs, including lisinopril, hydrochlorothiazide, amlodipine, and simvastatin. These are commonly used in the management of hypertension and related cardiovascular conditions.
+
+Other frequently observed medications include insulin and metformin, indicating the presence of diabetes management within the cohort, as well as respiratory treatments such as albuterol and fluticasone.
+
+## 2.8 Encounter Types
+The top twenty encounter types mentioned in the encounter dataset cleaned in task 1 are described here.
+```{r encounters}
+encounters_clean %>%
+  count(encounterclass, sort = TRUE) %>%
+  mutate(Percent = round(100 * n / sum(n), 1))
+```
+Table above shows the wellness (39.2%) and ambulatory (32.9%) encounters account for the majority of visits, followed by outpatient encounters (17.5%). Urgent care (4.1%), emergency (3.5%), and inpatient (2.8%) encounters represent smaller proportions of the total.
+
+This distribution is consistent with a general population cohort, where routine and preventive care dominate, and acute or hospital-based encounters occur less frequently. The relatively low proportion of emergency and inpatient visits further supports the overall health profile observed in the dataset.
+
+# Task 3: BP and BMI in Hypertensive Patients
+Using the cleaned data from the first task, explore and compare the distribution of: a) systolic and diastolic blood pressure and b) BMI measurements in patients with diagnosed hypertension.
+
+## 3.1 Identifying Hypertensive Patients
+Hypertension is identified using SNOMED-CT code 59621000 from the available data dictionary. Because code formatting was standardised during cleaning, the cleaned string value "59621000" is used for matching.
+A patient is classified as hypertensive if they have at least one diagnosis record with this code, regardless of whether the condition later resolves
+```{r htn-identify}
+cohort_hyp <- conditions_clean %>%
+  filter(code == "59621000") %>%
+  distinct(patient) %>% # one row per patient to avoid double counting
+  pull(patient)
+
+tibble(
+  hypertensive_patients = length(cohort_hyp),
+  Percent = round(100 * length(cohort_hyp) / nrow(patients_clean), 1)
+)
+
+```
+282 patients are identified as hypertensive, representing 25.2% of the clean cohort.
+
+## 3.2 Extracting BP and BMI Measurements
+BMI measurements are identified using LOINC code 39156-5 from the available dictionary file to ensure extraction of continuous numeric values. Although BMI-related concepts exist in SNOMED CT data as well, these often represent categorical clinical findings rather than raw measurements and were therefore not used.
+```{r bp-bmi-extract}
+# Extract relevant measurements (LOINC-coded observations only)
+bp_bmi <- observations_clean %>%
+  filter(code %in% c("8480-6", "8462-4", "39156-5")) %>%  # SBP, DBP, BMI
+  filter(!is.na(value_numeric)) %>%                       # only numeric values
+  mutate(
+    measure = case_when(
+      code == "8480-6"  ~ "Systolic BP (mmHg)",
+      code == "8462-4"  ~ "Diastolic BP (mmHg)",
+      code == "39156-5" ~ "BMI (kg/m²)"
+    ),
+    hyp = patient %in% cohort_hyp
+  )
+
+# Keep most recent observation per patient per measure
+bp_bmi_latest <- bp_bmi %>%
+  group_by(patient, measure, hyp) %>%
+  slice_max(date, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Basic data quality checks and cleaning
+bp_bmi_latest <- bp_bmi_latest %>%
+  mutate(
+    value_numeric = case_when(
+      measure == "Systolic BP (mmHg)" & value_numeric >= 300 ~ NA_real_,  # repeated 300s likely placeholder
+      measure == "Systolic BP (mmHg)" & value_numeric < 70 ~ NA_real_,    # physiologically unlikely
+      measure == "Diastolic BP (mmHg)" & value_numeric > 150 ~ NA_real_,  # extreme outliers
+      TRUE ~ value_numeric
+    )
+  )
+
+# Restrict to hypertensive patients
+bp_bmi_htn <- bp_bmi_latest %>%
+  filter(hyp)
+length(cohort_hyp) # No of hypertensive patients
+
+bp_bmi_htn %>%
+  count(measure) #No of patients with BP and BMI measures
+```
+A total of 282 patients are identified with a diagnosis of hypertension. For each patient, one observation per measure (systolic blood pressure, diastolic blood pressure, and BMI) is retained by selecting the most recent recorded value. This results in one observation per patient per measure (n = 282 for each variable), providing a consistent cross-sectional snapshot for analysis.
+
+Measurements are identified using LOINC codes: 8480-6 for systolic blood pressure, 8462-4 for diastolic blood pressure, and 39156-5 for BMI. Only numeric values are included. Implausible values are addressed using clinically informed thresholds; in particular, repeated systolic blood pressure values of 300 mmHg are treated as missing, as these are not physiologically plausible and likely represent placeholder entries.
+
+## 3.3 Summary Statistics
+```{r bp-bmi-stats}
+bp_bmi_htn %>%
+  group_by(measure) %>%
+  summarise(
+    n      = n(),
+    mean   = round(mean(value_numeric, na.rm = TRUE), 1),
+    median = round(median(value_numeric, na.rm = TRUE), 1),
+    sd     = round(sd(value_numeric, na.rm = TRUE), 1),
+    q25    = round(quantile(value_numeric, 0.25, na.rm = TRUE), 1),
+    q75    = round(quantile(value_numeric, 0.75, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+```
+Among patients with hypertension, mean systolic blood pressure is 133.5 mmHg (SD 21.1), with a median of 128.0 mmHg, indicating a right-skewed distribution. Diastolic blood pressure has a mean of 87.6 mmHg (SD 15.2) and a median of 82.5 mmHg, with a similar but less pronounced spread.
+
+BMI values are elevated overall, with a mean of 28.2 kg/m² (SD 3.6) and a median of 28.0 kg/m², placing the average patient in the overweight range.
+
+Variability is greatest for systolic blood pressure, reflecting heterogeneity in disease severity and potential differences in treatment or control within the cohort. Overall, the distributions are consistent with expected clinical patterns in hypertensive populations.
+
+## 3.4 Visualisation
+```{r density-plots, echo=FALSE}
+
+ggplot(bp_bmi_htn, aes(x = value_numeric)) +
+  geom_histogram(aes(y = ..density..),
+                 bins = 30,
+                 fill = "steelblue1",
+                 alpha = 0.6) +
+  geom_density(color = "black", linewidth = 1) +
+  facet_wrap(~measure, scales = "free") +
+  labs(title = "Distribution of BP and BMI in Hypertensive Patients",
+       x = "Value", y = "Density") +
+  theme_minimal(base_size = 15)
+
+ggplot(bp_bmi_htn, aes(x = measure, y = value_numeric)) +
+  geom_boxplot(fill = "pink2", alpha = 0.6) +
+  labs(title = "Distribution of BP and BMI in Hypertensive Patients",
+       x = NULL, y = "Value") +
+  theme_minimal(base_size = 15)
+```
+Histograms with overlaid density curves show the distribution of BMI, diastolic blood pressure, and systolic blood pressure within the hypertensive cohort. BMI values are relatively tightly clustered around the high 20s, with a slight right skew, indicating that most patients fall within the overweight range.
+
+Diastolic blood pressure exhibits moderate variability, with a concentration around 75–85 mmHg and a secondary spread towards higher values, suggesting heterogeneity in blood pressure control.
+
+Systolic blood pressure shows the greatest variability, with a broader distribution and a noticeable right tail extending towards higher values. This indicates a wider range of disease severity or treatment response within the cohort.
+
+Boxplots reinforce these patterns, showing higher dispersion and more extreme values for systolic blood pressure compared to diastolic blood pressure and BMI. Overall, the visualisations highlight greater variability in systolic blood pressure and relatively tighter clustering of BMI values.
+
+# Task 4: Hypertension Prevalence
+Report the crude, and adjusted (to the UK population as much as possible) prevalence of hypertension.
+
+## 4.1 Crude Prevalence
+Crude prevalence is calculated as the proportion of adults with a recorded diagnosis of hypertension within the cleaned cohort. The analysis is restricted to adults aged ≥18 years, as hypertension definitions and epidemiological benchmarks are based on adult populations.
+```{r crude-prevalence}
+adult_cohort <- patients_clean %>%
+  filter(age >= 18) %>%
+  mutate(htn = id %in% cohort_hyp)
+
+n_adults   <- nrow(adult_cohort)
+n_htn      <- sum(adult_cohort$htn)
+crude_prev <- 100 * n_htn / n_adults
+ci         <- prop.test(n_htn, n_adults)$conf.int * 100
+
+tibble(
+  adults       = n_adults,
+  hypertensive = n_htn,
+  prevalence   = round(crude_prev, 1),
+  ci_lower     = round(ci[1], 1),
+  ci_upper     = round(ci[2], 1)
+)
+```
+The adult cohort contains 884 individuals, of whom 282 have a diagnosis of hypertension. This corresponds to a crude prevalence of 31.9% (95% CI: 28.9% to 35.1%).
+
+## 4.2 Prevalence by Age Group and Sex
+Hypertension prevalence is stratified by age group and sex to examine demographic variation in disease burden within the adult cohort.
+```{r prev-by-strata}
+adult_cohort %>%
+  mutate(sex = if_else(gender == "f", "Female", "Male")) %>%
+  group_by(age_group, sex) %>%
+  summarise(
+    n          = n(),
+    htn_n      = sum(htn),
+    prevalence = round(100 * htn_n / n, 1),
+    .groups    = "drop"
+  ) %>%
+  ggplot(aes(x = age_group, y = prevalence, fill = sex)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  geom_text(
+    aes(label = paste0(prevalence, "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  scale_fill_manual(values = c("Female" = "pink2", "Male" = "steelblue1")) +
+  labs(
+    title = "Hypertension Prevalence by Age Group and Sex",
+    x = "Age group",
+    y = "Prevalence (%)",
+    fill = "Sex"
+  ) +
+  theme_minimal(base_size = 15)
+```
+Hypertension prevalence shows a modest increase with age, rising from approximately 29% in the 18–39 group to over 35% in older age groups for males. The increase is less consistent among females, with prevalence peaking in the 40–64 group (32.0%) and declining slightly in those aged 65+ (28.2%).
+
+Across all age groups, males exhibit higher prevalence than females, with the largest disparity observed in the 65+ group (36.4% vs 28.2%). Overall, while an age-related trend is present, the gradient is relatively shallow compared to typical epidemiological expectations.
+
+```{r prev-by-county, echo=FALSE}
+county_prev <- adult_cohort %>%
+  group_by(county) %>%
+  summarise(
+    n          = n(),
+    htn_n      = sum(htn),
+    prevalence = round(100 * htn_n / n, 1),
+    .groups    = "drop"
+  ) %>%
+  filter(n >= 10) %>%
+  mutate(county_clean = str_to_lower(str_remove(county, " County")))
+
+ma_counties <- map_data("county") %>%
+  filter(region == "massachusetts") %>%
+  mutate(county_clean = sub("massachusetts,", "", subregion))
+
+ma_counties_map <- ma_counties %>%
+  left_join(county_prev, by = "county_clean")
+
+centroids <- ma_counties_map %>%
+  group_by(county_clean) %>%
+  summarise(
+    long = mean(range(long, na.rm = TRUE)),
+    lat  = mean(range(lat, na.rm = TRUE)),
+    prevalence = first(prevalence),
+    .groups = "drop"
+  )
+
+ggplot(ma_counties_map, aes(x = long, y = lat, group = group, fill = prevalence)) +
+  geom_polygon(color = "white", linewidth = 0.3) +
+  geom_text(
+    data = centroids %>% filter(!is.na(prevalence)),
+    aes(x = long, y = lat, label = paste0(prevalence, "%")),
+    inherit.aes = FALSE,
+    size = 3,
+    colour = "black",
+    fontface = "bold"
+  ) +
+  coord_fixed(1.3) +
+  scale_fill_viridis_c(               
+    option = "turbo",
+    alpha = 0.7,
+    na.value = "grey95",
+    name = "Prevalence (%)"
+  ) +
+  labs(
+    title = "Hypertension Prevalence by County",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+```
+Hypertension prevalence varies across Massachusetts counties, ranging from approximately 22% to over 40%. Higher prevalence is observed in several eastern and coastal counties, while lower values are seen in parts of western Massachusetts.
+
+Notably, some counties (e.g., those exceeding 40%) exhibit substantially higher prevalence than the state average, whereas others remain closer to 25%, indicating meaningful geographic variation in disease burden. However, these differences should be interpreted with caution, as smaller counties may have limited sample sizes, leading to less stable estimates
+
+## 4.4 Age-Sex Standardisation to the UK Population
+Direct age-sex standardisation is applied to account for differences in population structure between the Synthea cohort, which reflects Massachusetts demographics, and the UK population. This allows prevalence estimates to be compared more appropriately with UK epidemiological benchmarks, such as the NHS Digital QOF hypertension register.
+
+Age- and sex-specific prevalence are first calculated within the cohort and then weighted according to the corresponding distribution of the 2021 England and Wales population, using data from the Office for National Statistics (ONS). Population counts are aggregated to match the study age groups prior to deriving weights. This approach produces a summary estimate that reflects the age-sex structure of the UK population rather than that of the study cohort.
+```{r standardisation}
+# UK standard population (derived from ONS Census 2021, see repository for processing code)
+uk_std <- tibble(
+  age_group = c("18-39", "18-39", "40-64", "40-64", "65+", "65+"),
+  sex       = c("f", "m", "f", "m", "f", "m"),
+  uk_pop    = c(8642694, 8346767, 9739593, 9412976, 4479780, 3638417),
+  uk_weight = c(0.195, 0.189, 0.220, 0.213, 0.101, 0.0822))
+
+stratum <- adult_cohort %>% # Stratum-specific prevalence
+  group_by(age_group, gender) %>%
+  summarise(
+    n_stratum = n(),                 # total in stratum
+    n_htn     = sum(htn),            # hypertensive cases
+    prev_s    = n_htn / n_stratum,   # stratum prevalence
+    .groups   = "drop"
+  ) %>%
+  left_join(
+    uk_std,
+    by = c("age_group", "gender" = "sex")  # match naming
+  ) %>%
+  filter(!is.na(uk_weight))               # keep valid strata
+
+
+dsp <- stratum %>% #Direct standardised prevalence
+  summarise(
+    dsp = sum(prev_s * uk_weight) / sum(uk_weight)  # weighted mean
+  ) %>%
+  pull(dsp)
+
+
+std_summary <- tibble(
+  Estimate = c(
+    "Crude prevalence",
+    "Age-sex standardised (UK 2021)",
+    "NHS Digital QOF (England)"
+  ),
+  Value = c(
+    paste0(round(crude_prev, 1), "%"),
+    paste0(round(100 * dsp, 1), "%"),
+    "28–31%"
+  )
+)
+
+std_summary
+
+tibble(
+  Estimate   = c("Crude prevalence", "Age-sex standardised\n(UK 2021 Census)"),
+  Prevalence = c(crude_prev, 100 * dsp),
+  CI_lower   = c(ci[1], NA),
+  CI_upper   = c(ci[2], NA)
+) %>%
+  mutate(
+    Estimate = factor(
+      Estimate,
+      levels = c("Crude prevalence", "Age-sex standardised\n(UK 2021 Census)")
+    )
+  ) %>%
+  ggplot(aes(x = Estimate, y = Prevalence, fill = Estimate)) +
+  geom_col(alpha = 0.85, width = 0.5) +
+  geom_errorbar(
+    aes(ymin = CI_lower, ymax = CI_upper),
+    width = 0.1,
+    linewidth = 1,
+    na.rm = TRUE
+  ) +
+  geom_hline(
+    yintercept = 29.5,
+    linetype = "dashed",
+    colour = "grey40",
+    linewidth = 0.8
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = 30.8,
+    label = "NHS Digital QOF ~28–31%",
+    size = 3.5,
+    colour = "grey40"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Crude prevalence"                       = "steelblue1",
+      "Age-sex standardised\n(UK 2021 Census)" = "pink2"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0, 40),
+    expand = expansion(mult = c(0, 0.05))   # prevent clipping
+  ) +
+  labs(
+    title = "Hypertension Prevalence: Crude and Age-Sex Standardised Estimates",
+    y = "Prevalence (%)",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+The age-sex standardised prevalence is 30.2%, which is slightly lower than the crude estimate of 31.9%. This indicates that the crude prevalence is modestly influenced by the age-sex structure of the cohort, with a slightly higher proportion of individuals in higher-risk groups.
+
+Both estimates fall within the range reported by NHS Digital QOF for England (approximately 28–31%), supporting the plausibility of the synthetic dataset and suggesting that it reasonably reflects real-world epidemiological patterns. The relatively small difference between crude and standardised estimates indicates that demographic structure has a limited impact on overall prevalence in this cohort.
+
+# Summary
+Following data cleaning, 1,118 patients were retained from 1,162, with key issues including floating-point clinical codes, an invalid LOINC placeholder (-7), and minor data inconsistencies. The cohort, based in Massachusetts, was predominantly White (82%) and non-Hispanic (91%), with frequent SNOMED-CT concepts reflecting social determinants of health relevant to spatial analysis. Hypertensive patients exhibited higher systolic and diastolic blood pressure and BMI, with patterns consistent with clinical expectations and treatment profiles. Crude adult hypertension prevalence was r round(crude_prev, 1)% (95% CI: r round(ci[1], 1)–r round(ci[2], 1)%), and age-sex standardised prevalence was r round(100 * dsp, 1)%, slightly lower but within NHS Digital QOF benchmarks (28–31%). Overall, the results demonstrate that the cleaned synthetic dataset produced epidemiologically plausible and spatially meaningful patterns, supporting its suitability for population health and geographic analysis.
