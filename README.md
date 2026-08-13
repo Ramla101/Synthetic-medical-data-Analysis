@@ -4,9 +4,9 @@ Analysis of synthetic healthcare data to estimate crude and UK age-sex standardi
 ## Repository Structure
 The repository is organised to separate inputs, analysis, and outputs.
 
-- Analysis_markdown.Rmd: Main analysis script containing data cleaning, cohort definition, prevalence estimation, and visualisations.
-- Analysis_report.html and Analysis_report_word.docx: Rendered report files generated from the R Markdown file.
-- input/: Folder containing all source materials required for the analysis including Synthetic datasets (patients, conditions, observations, medications, encounters), data dictionaries (SNOMED-CT and LOINC mappings), and the original technical test document provided as part of the assessment
+- R-markdown file for analysis.Rmd: Main analysis script containing data cleaning, cohort definition, prevalence estimation, and visualisations.
+- HTML file for the analysis.html and Analysis_report_word.docx: Rendered report files generated from the R Markdown file.
+- input/: Folder containing all source materials required for the analysis including Synthetic datasets (patients, conditions, observations, medications, encounters), and data dictionaries (SNOMED-CT and LOINC mappings).
 - uk_population/: Folder containing the ONS population data and the R script used to derive age-sex weights for standardisation.
 
 ## UK Population Data
